@@ -27,8 +27,8 @@ cp ./codex-auth-switch ~/.local/bin/
 
 ```text
 Codex profiles:
- 1. * personal
- 2.   work
+ 1. * personal  personal@example.com
+ 2.   work      work@example.com
 
 输入序号切换，或直接回车取消:
 ```
@@ -58,6 +58,7 @@ Codex profiles:
 ./codex-auth-switch
 ./codex-auth-switch ls
 ./codex-auth-switch whoami
+./codex-auth-switch email
 ./codex-auth-switch add work --force
 ./codex-auth-switch rm work --force
 ```
@@ -75,6 +76,8 @@ Codex profiles:
 - 不要把 profile 文件提交到 Git。
 - 不要把 `~/.codex/auth-profiles/` 同步到不可信网盘。
 - 如果某个账号不再使用，先在账号侧撤销会话，再删除对应 profile。
+
+菜单、`ls`、`whoami` 和 `email` 会从本地 JWT payload 中解析邮箱；不会打印 token，也不会查询订阅类型或剩余额度。
 
 ## 自定义路径
 

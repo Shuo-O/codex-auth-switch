@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import json
 import os
@@ -33,16 +35,76 @@ def profile_path(name: str, profiles_dir: Path) -> Path:
     return profiles_dir / f"{name}.json"
 
 
-def ensure_json_file(path: Path) -> None:
+def read_json_file(path: Path) -> object:
     if not path.exists():
         die(f"文件不存在: {path}")
     if not path.is_file():
         die(f"不是普通文件: {path}")
     try:
         with path.open("r", encoding="utf-8") as f:
-            json.load(f)
+            return json.load(f)
     except json.JSONDecodeError as exc:
         die(f"JSON 无法解析: {path}: {exc}")
+
+
+def ensure_json_file(path: Path) -> None:
+    read_json_file(path)
+
+
+def decode_jwt_payload(token: str) -> dict[str, object]:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        data = json.loads(decoded)
+    except (binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def email_from_payload(payload: dict[str, object]) -> str | None:
+    email = payload.get("email")
+    if isinstance(email, str) and email:
+        return email
+
+    profile = payload.get("https://api.openai.com/profile")
+    if isinstance(profile, dict):
+        profile_email = profile.get("email")
+        if isinstance(profile_email, str) and profile_email:
+            return profile_email
+    return None
+
+
+def email_from_auth_data(data: object) -> str | None:
+    if not isinstance(data, dict):
+        return None
+
+    token_sources = []
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        token_sources.extend(tokens.get(key) for key in ("id_token", "access_token"))
+    token_sources.extend(data.get(key) for key in ("id_token", "access_token"))
+
+    for token in token_sources:
+        if not isinstance(token, str):
+            continue
+        email = email_from_payload(decode_jwt_payload(token))
+        if email:
+            return email
+    return None
+
+
+def email_from_auth_file(path: Path) -> str | None:
+    return email_from_auth_data(read_json_file(path))
+
+
+def safe_email_from_auth_file(path: Path) -> str:
+    try:
+        return email_from_auth_file(path) or "-"
+    except CliError:
+        return "-"
 
 
 def chmod_owner_only(path: Path) -> None:
@@ -133,7 +195,8 @@ def cmd_list(args: argparse.Namespace) -> None:
         print("暂无 profiles")
         return
     for name in profiles:
-        print(name)
+        email = safe_email_from_auth_file(profile_path(name, profiles_dir))
+        print(f"{name}\t{email}")
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
@@ -151,6 +214,7 @@ def cmd_current(args: argparse.Namespace) -> None:
     auth_path = args.auth.expanduser()
     profiles_dir = args.profiles_dir.expanduser()
     matches = matching_profiles(auth_path, profiles_dir)
+    email = email_from_auth_file(auth_path)
 
     if matches:
         print("当前 auth 匹配 profile:")
@@ -158,6 +222,18 @@ def cmd_current(args: argparse.Namespace) -> None:
             print(name)
     else:
         print("当前 auth 未匹配任何已保存 profile")
+    if email:
+        print(f"邮箱: {email}")
+    else:
+        print("邮箱: -")
+
+
+def cmd_email(args: argparse.Namespace) -> None:
+    auth_path = args.auth.expanduser()
+    email = email_from_auth_file(auth_path)
+    if not email:
+        die("当前 auth.json 中没有可解析的邮箱")
+    print(email)
 
 
 def cmd_menu(args: argparse.Namespace) -> None:
@@ -174,7 +250,8 @@ def cmd_menu(args: argparse.Namespace) -> None:
     print("Codex profiles:")
     for index, name in enumerate(profiles, start=1):
         marker = "*" if name in matches else " "
-        print(f"{index:>2}. {marker} {name}")
+        email = safe_email_from_auth_file(profile_path(name, profiles_dir))
+        print(f"{index:>2}. {marker} {name}  {email}")
     print()
     choice = input("输入序号切换，或直接回车取消: ").strip()
     if not choice:
@@ -247,6 +324,11 @@ def build_parser() -> argparse.ArgumentParser:
         "current", aliases=["whoami"], help="显示当前 auth 匹配哪个 profile"
     )
     current.set_defaults(func=cmd_current)
+
+    email = subparsers.add_parser(
+        "email", aliases=["mail"], help="显示当前 auth.json 中可解析的邮箱"
+    )
+    email.set_defaults(func=cmd_email)
 
     remove = subparsers.add_parser(
         "remove", aliases=["rm"], help="删除一个 profile"
