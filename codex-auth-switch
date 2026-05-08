@@ -195,8 +195,7 @@ def cmd_list(args: argparse.Namespace) -> None:
         print("暂无 profiles")
         return
     for name in profiles:
-        email = safe_email_from_auth_file(profile_path(name, profiles_dir))
-        print(f"{name}\t{email}")
+        print(name)
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
@@ -214,7 +213,6 @@ def cmd_current(args: argparse.Namespace) -> None:
     auth_path = args.auth.expanduser()
     profiles_dir = args.profiles_dir.expanduser()
     matches = matching_profiles(auth_path, profiles_dir)
-    email = email_from_auth_file(auth_path)
 
     if matches:
         print("当前 auth 匹配 profile:")
@@ -222,18 +220,6 @@ def cmd_current(args: argparse.Namespace) -> None:
             print(name)
     else:
         print("当前 auth 未匹配任何已保存 profile")
-    if email:
-        print(f"邮箱: {email}")
-    else:
-        print("邮箱: -")
-
-
-def cmd_email(args: argparse.Namespace) -> None:
-    auth_path = args.auth.expanduser()
-    email = email_from_auth_file(auth_path)
-    if not email:
-        die("当前 auth.json 中没有可解析的邮箱")
-    print(email)
 
 
 def cmd_menu(args: argparse.Namespace) -> None:
@@ -248,10 +234,11 @@ def cmd_menu(args: argparse.Namespace) -> None:
         matches = matching_profiles(auth_path, profiles_dir)
 
     print("Codex profiles:")
+    name_width = max(len(name) for name in profiles)
     for index, name in enumerate(profiles, start=1):
         marker = "*" if name in matches else " "
         email = safe_email_from_auth_file(profile_path(name, profiles_dir))
-        print(f"{index:>2}. {marker} {name}  {email}")
+        print(f"{index:>2}. {marker} {name:<{name_width}}  {email}")
     print()
     choice = input("输入序号切换，或直接回车取消: ").strip()
     if not choice:
@@ -324,11 +311,6 @@ def build_parser() -> argparse.ArgumentParser:
         "current", aliases=["whoami"], help="显示当前 auth 匹配哪个 profile"
     )
     current.set_defaults(func=cmd_current)
-
-    email = subparsers.add_parser(
-        "email", aliases=["mail"], help="显示当前 auth.json 中可解析的邮箱"
-    )
-    email.set_defaults(func=cmd_email)
 
     remove = subparsers.add_parser(
         "remove", aliases=["rm"], help="删除一个 profile"
