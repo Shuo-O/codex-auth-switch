@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Switch Codex auth.json profiles without logging in repeatedly."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+
+DEFAULT_AUTH = Path("~/.codex/auth.json").expanduser()
+DEFAULT_PROFILES = Path("~/.codex/auth-profiles").expanduser()
+PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+class CliError(Exception):
+    pass
+
+
+def die(message: str) -> None:
+    raise CliError(message)
+
+
+def profile_path(name: str, profiles_dir: Path) -> Path:
+    if not PROFILE_RE.fullmatch(name):
+        die("profile 名只能包含字母、数字、点号、下划线和短横线")
+    return profiles_dir / f"{name}.json"
+
+
+def ensure_json_file(path: Path) -> None:
+    if not path.exists():
+        die(f"文件不存在: {path}")
+    if not path.is_file():
+        die(f"不是普通文件: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            json.load(f)
+    except json.JSONDecodeError as exc:
+        die(f"JSON 无法解析: {path}: {exc}")
+
+
+def chmod_owner_only(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except PermissionError:
+        pass
+
+
+def copy_atomic(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "wb", delete=False, dir=str(dst.parent), prefix=f".{dst.name}.", suffix=".tmp"
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+        with src.open("rb") as f:
+            shutil.copyfileobj(f, tmp)
+    shutil.copystat(src, tmp_path, follow_symlinks=True)
+    chmod_owner_only(tmp_path)
+    os.replace(tmp_path, dst)
+
+
+def backup_current(auth_path: Path, profiles_dir: Path) -> Path | None:
+    if not auth_path.exists():
+        return None
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup_dir = profiles_dir / ".backups"
+    backup_path = backup_dir / f"auth-{timestamp}.json"
+    copy_atomic(auth_path, backup_path)
+    return backup_path
+
+
+def list_profile_names(profiles_dir: Path) -> list[str]:
+    if not profiles_dir.exists():
+        return []
+    return sorted(path.stem for path in profiles_dir.glob("*.json") if path.is_file())
+
+
+def matching_profiles(auth_path: Path, profiles_dir: Path) -> list[str]:
+    ensure_json_file(auth_path)
+    current = auth_path.read_bytes()
+    matches = []
+    if profiles_dir.exists():
+        for path in sorted(profiles_dir.glob("*.json")):
+            if path.is_file() and path.read_bytes() == current:
+                matches.append(path.stem)
+    return matches
+
+
+def switch_profile(
+    name: str, auth_path: Path, profiles_dir: Path, no_backup: bool = False
+) -> Path | None:
+    source = profile_path(name, profiles_dir)
+    ensure_json_file(source)
+    backup_path = None if no_backup else backup_current(auth_path, profiles_dir)
+    copy_atomic(source, auth_path)
+    return backup_path
+
+
+def cmd_save(args: argparse.Namespace) -> None:
+    auth_path = args.auth.expanduser()
+    profiles_dir = args.profiles_dir.expanduser()
+    ensure_json_file(auth_path)
+
+    target = profile_path(args.name, profiles_dir)
+    if target.exists() and not args.force:
+        die(f"profile 已存在: {args.name}，如需覆盖请加 --force")
+
+    copy_atomic(auth_path, target)
+    print(f"已保存当前 Codex 登录态为 profile: {args.name}")
+    print(f"位置: {target}")
+
+
+def cmd_use(args: argparse.Namespace) -> None:
+    auth_path = args.auth.expanduser()
+    profiles_dir = args.profiles_dir.expanduser()
+    backup_path = switch_profile(args.name, auth_path, profiles_dir, args.no_backup)
+    print(f"已切换到 profile: {args.name}")
+    print(f"写入: {auth_path}")
+    if backup_path:
+        print(f"已备份切换前 auth: {backup_path}")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    profiles_dir = args.profiles_dir.expanduser()
+    profiles = list_profile_names(profiles_dir)
+    if not profiles:
+        print("暂无 profiles")
+        return
+    for name in profiles:
+        print(name)
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    profiles_dir = args.profiles_dir.expanduser()
+    target = profile_path(args.name, profiles_dir)
+    if not target.exists():
+        die(f"profile 不存在: {args.name}")
+    if not args.force:
+        die(f"删除 profile: {args.name} 需要加 --force")
+    target.unlink()
+    print(f"已删除 profile: {args.name}")
+
+
+def cmd_current(args: argparse.Namespace) -> None:
+    auth_path = args.auth.expanduser()
+    profiles_dir = args.profiles_dir.expanduser()
+    matches = matching_profiles(auth_path, profiles_dir)
+
+    if matches:
+        print("当前 auth 匹配 profile:")
+        for name in matches:
+            print(name)
+    else:
+        print("当前 auth 未匹配任何已保存 profile")
+
+
+def cmd_menu(args: argparse.Namespace) -> None:
+    auth_path = args.auth.expanduser()
+    profiles_dir = args.profiles_dir.expanduser()
+    profiles = list_profile_names(profiles_dir)
+    if not profiles:
+        die("暂无 profiles。先登录一个账号，然后运行: codex-auth-switch add <name>")
+
+    matches = []
+    if auth_path.exists():
+        matches = matching_profiles(auth_path, profiles_dir)
+
+    print("Codex profiles:")
+    for index, name in enumerate(profiles, start=1):
+        marker = "*" if name in matches else " "
+        print(f"{index:>2}. {marker} {name}")
+    print()
+    choice = input("输入序号切换，或直接回车取消: ").strip()
+    if not choice:
+        print("已取消")
+        return
+    if not choice.isdigit():
+        die("请输入列表里的数字序号")
+    index = int(choice)
+    if index < 1 or index > len(profiles):
+        die("序号超出范围")
+
+    name = profiles[index - 1]
+    backup_path = switch_profile(name, auth_path, profiles_dir, args.no_backup)
+    print(f"已切换到 profile: {name}")
+    if backup_path:
+        print(f"已备份切换前 auth: {backup_path}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-auth-switch",
+        description="通过替换 Codex auth.json 快速切换多个账号。",
+    )
+    parser.add_argument(
+        "--auth",
+        type=Path,
+        default=DEFAULT_AUTH,
+        help=f"Codex auth.json 路径，默认: {DEFAULT_AUTH}",
+    )
+    parser.add_argument(
+        "--profiles-dir",
+        type=Path,
+        default=DEFAULT_PROFILES,
+        help=f"profile 存放目录，默认: {DEFAULT_PROFILES}",
+    )
+
+    parser.set_defaults(func=cmd_menu)
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="交互切换前不备份当前 auth.json",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    save = subparsers.add_parser(
+        "save", aliases=["add"], help="把当前 auth.json 保存为一个 profile"
+    )
+    save.add_argument("name", help="profile 名称，例如 work 或 personal")
+    save.add_argument("-f", "--force", action="store_true", help="覆盖同名 profile")
+    save.set_defaults(func=cmd_save)
+
+    use = subparsers.add_parser(
+        "use", aliases=["switch"], help="切换到指定 profile"
+    )
+    use.add_argument("name", help="profile 名称")
+    use.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="切换前不备份当前 auth.json",
+    )
+    use.set_defaults(func=cmd_use)
+
+    list_profiles = subparsers.add_parser(
+        "list", aliases=["ls"], help="列出已保存 profiles"
+    )
+    list_profiles.set_defaults(func=cmd_list)
+
+    current = subparsers.add_parser(
+        "current", aliases=["whoami"], help="显示当前 auth 匹配哪个 profile"
+    )
+    current.set_defaults(func=cmd_current)
+
+    remove = subparsers.add_parser(
+        "remove", aliases=["rm"], help="删除一个 profile"
+    )
+    remove.add_argument("name", help="profile 名称")
+    remove.add_argument("-f", "--force", action="store_true", help="确认删除")
+    remove.set_defaults(func=cmd_remove)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except CliError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
