@@ -27,8 +27,8 @@ cp ./codex-auth-switch ~/.local/bin/
 
 ```text
 Codex profiles:
- 1. * personal  personal@example.com
- 2.   work      work@example.com
+ 1. * personal  personal@example.com  access 2d
+ 2.   work      work@example.com      access expired
 
 输入序号切换，或直接回车取消:
 ```
@@ -51,6 +51,8 @@ Codex profiles:
 ./codex-auth-switch switch personal
 ./codex-auth-switch switch work
 ```
+
+打开菜单或切换前，工具会尝试识别当前 `auth.json` 属于哪个 profile，并在当前文件不比已保存 profile 更旧时回写到对应 profile。这样 Codex 在使用过程中刷新过 token 时，保存的 profile 会跟着更新，减少旧快照几天后失效的问题。
 
 ## 常用命令
 
@@ -76,7 +78,7 @@ Codex profiles:
 - 不要把 `~/.codex/auth-profiles/` 同步到不可信网盘。
 - 如果某个账号不再使用，先在账号侧撤销会话，再删除对应 profile。
 
-菜单会从本地 JWT payload 中解析邮箱；不会打印 token，也不会查询订阅类型或剩余额度。
+菜单会从本地 JWT payload 中解析邮箱和 access token 过期时间；不会打印 token，也不会查询订阅类型或剩余额度。access token 过期不一定代表 refresh token 已失效，但可以提示这个 profile 可能需要重新登录并覆盖保存。
 
 ## 自定义路径
 

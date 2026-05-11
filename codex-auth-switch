@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+from dataclasses import dataclass
 import datetime as dt
 import json
 import os
@@ -23,6 +24,12 @@ PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 class CliError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class SwitchResult:
+    backup_path: Path | None = None
+    synced_profile: str | None = None
 
 
 def die(message: str) -> None:
@@ -96,6 +103,89 @@ def email_from_auth_data(data: object) -> str | None:
     return None
 
 
+def jwt_payloads_from_auth_data(data: object) -> list[dict[str, object]]:
+    if not isinstance(data, dict):
+        return []
+
+    token_sources = []
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        token_sources.extend(tokens.get(key) for key in ("access_token", "id_token"))
+    token_sources.extend(data.get(key) for key in ("access_token", "id_token"))
+
+    payloads = []
+    for token in token_sources:
+        if isinstance(token, str):
+            payload = decode_jwt_payload(token)
+            if payload:
+                payloads.append(payload)
+    return payloads
+
+
+def identity_from_auth_data(data: object) -> str | None:
+    if not isinstance(data, dict):
+        return None
+
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        account_id = tokens.get("account_id")
+        if isinstance(account_id, str) and account_id:
+            return f"account:{account_id}"
+
+    for payload in jwt_payloads_from_auth_data(data):
+        sub = payload.get("sub")
+        if isinstance(sub, str) and sub:
+            return f"sub:{sub}"
+
+    email = email_from_auth_data(data)
+    return f"email:{email}" if email else None
+
+
+def identity_from_auth_file(path: Path) -> str | None:
+    return identity_from_auth_data(read_json_file(path))
+
+
+def access_token_exp_from_auth_data(data: object) -> int | None:
+    if not isinstance(data, dict):
+        return None
+
+    token_sources = []
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        token_sources.append(tokens.get("access_token"))
+    token_sources.append(data.get("access_token"))
+
+    for token in token_sources:
+        if not isinstance(token, str):
+            continue
+        exp = decode_jwt_payload(token).get("exp")
+        if isinstance(exp, int):
+            return exp
+        if isinstance(exp, str) and exp.isdigit():
+            return int(exp)
+    return None
+
+
+def parse_timestamp(value: object) -> int | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return int(parsed.timestamp())
+
+
+def auth_freshness_score(data: object) -> tuple[int, int]:
+    if not isinstance(data, dict):
+        return (0, 0)
+    last_refresh = parse_timestamp(data.get("last_refresh")) or 0
+    access_exp = access_token_exp_from_auth_data(data) or 0
+    return (last_refresh, access_exp)
+
+
 def email_from_auth_file(path: Path) -> str | None:
     return email_from_auth_data(read_json_file(path))
 
@@ -105,6 +195,28 @@ def safe_email_from_auth_file(path: Path) -> str:
         return email_from_auth_file(path) or "-"
     except CliError:
         return "-"
+
+
+def token_status_from_auth_file(path: Path) -> str:
+    try:
+        exp = access_token_exp_from_auth_data(read_json_file(path))
+    except CliError:
+        return "token ?"
+    if exp is None:
+        return "token ?"
+
+    now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    remaining = exp - now
+    if remaining <= 0:
+        return "access expired"
+    if remaining < 3600:
+        minutes = max(1, remaining // 60)
+        return f"access {minutes}m"
+    if remaining < 86400:
+        hours = max(1, remaining // 3600)
+        return f"access {hours}h"
+    days = max(1, remaining // 86400)
+    return f"access {days}d"
 
 
 def chmod_owner_only(path: Path) -> None:
@@ -154,14 +266,62 @@ def matching_profiles(auth_path: Path, profiles_dir: Path) -> list[str]:
     return matches
 
 
+def find_profile_for_auth(auth_path: Path, profiles_dir: Path) -> str | None:
+    if not auth_path.exists() or not profiles_dir.exists():
+        return None
+
+    try:
+        exact_matches = matching_profiles(auth_path, profiles_dir)
+    except CliError:
+        return None
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    try:
+        current_identity = identity_from_auth_file(auth_path)
+    except CliError:
+        return None
+    if not current_identity:
+        return None
+
+    identity_matches = []
+    for name in list_profile_names(profiles_dir):
+        try:
+            profile_identity = identity_from_auth_file(profile_path(name, profiles_dir))
+        except CliError:
+            continue
+        if profile_identity == current_identity:
+            identity_matches.append(name)
+
+    return identity_matches[0] if len(identity_matches) == 1 else None
+
+
+def sync_current_profile(auth_path: Path, profiles_dir: Path) -> str | None:
+    current_profile = find_profile_for_auth(auth_path, profiles_dir)
+    if not current_profile:
+        return None
+
+    target = profile_path(current_profile, profiles_dir)
+    current_data = read_json_file(auth_path)
+    target_data = read_json_file(target)
+    if auth_freshness_score(current_data) < auth_freshness_score(target_data):
+        return None
+
+    if auth_path.read_bytes() != target.read_bytes():
+        copy_atomic(auth_path, target)
+        return current_profile
+    return None
+
+
 def switch_profile(
     name: str, auth_path: Path, profiles_dir: Path, no_backup: bool = False
-) -> Path | None:
+) -> SwitchResult:
     source = profile_path(name, profiles_dir)
     ensure_json_file(source)
+    synced_profile = sync_current_profile(auth_path, profiles_dir)
     backup_path = None if no_backup else backup_current(auth_path, profiles_dir)
     copy_atomic(source, auth_path)
-    return backup_path
+    return SwitchResult(backup_path=backup_path, synced_profile=synced_profile)
 
 
 def cmd_save(args: argparse.Namespace) -> None:
@@ -181,11 +341,13 @@ def cmd_save(args: argparse.Namespace) -> None:
 def cmd_use(args: argparse.Namespace) -> None:
     auth_path = args.auth.expanduser()
     profiles_dir = args.profiles_dir.expanduser()
-    backup_path = switch_profile(args.name, auth_path, profiles_dir, args.no_backup)
+    result = switch_profile(args.name, auth_path, profiles_dir, args.no_backup)
     print(f"已切换到 profile: {args.name}")
     print(f"写入: {auth_path}")
-    if backup_path:
-        print(f"已备份切换前 auth: {backup_path}")
+    if result.synced_profile:
+        print(f"已同步当前登录态到 profile: {result.synced_profile}")
+    if result.backup_path:
+        print(f"已备份切换前 auth: {result.backup_path}")
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -231,14 +393,26 @@ def cmd_menu(args: argparse.Namespace) -> None:
 
     matches = []
     if auth_path.exists():
-        matches = matching_profiles(auth_path, profiles_dir)
+        sync_current_profile(auth_path, profiles_dir)
+        current_profile = find_profile_for_auth(auth_path, profiles_dir)
+        if current_profile:
+            matches = [current_profile]
 
     print("Codex profiles:")
     name_width = max(len(name) for name in profiles)
-    for index, name in enumerate(profiles, start=1):
+    rows = []
+    for name in profiles:
+        path = profile_path(name, profiles_dir)
+        rows.append(
+            (name, safe_email_from_auth_file(path), token_status_from_auth_file(path))
+        )
+    email_width = max(len(email) for _, email, _ in rows)
+    for index, (name, email, status) in enumerate(rows, start=1):
         marker = "*" if name in matches else " "
-        email = safe_email_from_auth_file(profile_path(name, profiles_dir))
-        print(f"{index:>2}. {marker} {name:<{name_width}}  {email}")
+        print(
+            f"{index:>2}. {marker} {name:<{name_width}}  "
+            f"{email:<{email_width}}  {status}"
+        )
     print()
     choice = input("输入序号切换，或直接回车取消: ").strip()
     if not choice:
@@ -251,10 +425,12 @@ def cmd_menu(args: argparse.Namespace) -> None:
         die("序号超出范围")
 
     name = profiles[index - 1]
-    backup_path = switch_profile(name, auth_path, profiles_dir, args.no_backup)
+    result = switch_profile(name, auth_path, profiles_dir, args.no_backup)
     print(f"已切换到 profile: {name}")
-    if backup_path:
-        print(f"已备份切换前 auth: {backup_path}")
+    if result.synced_profile:
+        print(f"已同步当前登录态到 profile: {result.synced_profile}")
+    if result.backup_path:
+        print(f"已备份切换前 auth: {result.backup_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
